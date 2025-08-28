@@ -2,17 +2,17 @@ import os
 import pandas as pd
 import streamlit as st
 
-# Puxa a URL do Secrets
+# Pega a URL do Secrets
 URL_CSV = os.environ.get("SHEET_CSV_URL")
-@st.cache_data(ttl=15)  # cache de 15s para não sobrecarregar
+
+@st.cache_data(ttl=15)  # cache de 15s
 def read_sheet(url):
     return pd.read_csv(url)
 
 st.title("📊 Comparador de Odds – Escanteios")
 
 try:
-    df = read_sheet(CSV_URL)
-
+    df = read_sheet(URL_CSV)
     if df.empty:
         st.warning("Nenhum dado encontrado na planilha.")
     else:
