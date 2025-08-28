@@ -24,13 +24,34 @@ HEADERS = {
 }
 
 def get_html(url: str) -> str:
-    """Baixa HTML com headers básicos e pequeno retry."""
-    for _ in range(2):
-        r = requests.get(url, headers=HEADERS, timeout=20)
-        if r.status_code == 200 and r.text:
-            return r.text
-        time.sleep(1)
-    raise RuntimeError(f"Falha ao carregar {url} (status {r.status_code})")
+    """Baixa HTML com sessão persistente, redirecionamento e pequeno retry."""
+    with requests.Session() as s:
+        s.headers.update(HEADERS)
+
+        # 1) visita a home p/ ganhar cookies de sessão (ajuda em sites com WAF)
+        try:
+            base = "https://www.betano.bet.br" if "betano" in url else (
+                   "https://kto.bet.br" if "kto.bet.br" in url else None)
+            if base:
+                s.get(base, timeout=15, allow_redirects=True)
+        except Exception:
+            pass
+
+        # 2) tenta a URL alvo (2 tentativas)
+        last_exc = None
+        for _ in range(2):
+            try:
+                r = s.get(url, timeout=25, allow_redirects=True)
+                # alguns WAFs devolvem 403/429 temporário
+                if r.status_code == 200 and r.text:
+                    return r.text
+                time.sleep(1.2)
+            except Exception as e:
+                last_exc = e
+                time.sleep(1.2)
+        if last_exc:
+            raise last_exc
+        raise RuntimeError(f"Falha ao carregar {url}")
 
 def is_corners_label(txt: str) -> bool:
     """Detecta textos de mercado de escanteios."""
