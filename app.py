@@ -1,241 +1,125 @@
-import re, json, time
-from urllib.parse import urlparse
+import time, re, math
+import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 import streamlit as st
 
 st.set_page_config(page_title="Odds de Escanteios", layout="wide")
 st.title("📊 Comparador de Odds – Escanteios")
-st.caption("Cole os links do MESMO jogo em cada casa e clique em Atualizar. (Protótipo educacional).")
+st.caption("Frontend com cache global (15s). Betano/Bet365 via planilha; KTO raspado leve. Protótipo educacional.")
 
-# ---------- utilidades ----------
+# 1) URL da planilha publicada como CSV (defina em Settings → Secrets do Streamlit Cloud)
+SHEET_CSV_URL = st.secrets.get("SHEET_CSV_URL", "")
 
+# 2) Cabeçalhos mais realistas (ajuda em raspagens simples)
 HEADERS = {
-    # navegador comum (desktop)
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                    "AppleWebKit/537.36 (KHTML, like Gecko) "
                    "Chrome/123.0.0.0 Safari/537.36"),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-    "Referer": "https://www.betano.bet.br/",
-    "Connection": "keep-alive",
+    "Referer": "https://kto.bet.br/",
 }
 
-def get_html(url: str) -> str:
-    """Baixa HTML com sessão persistente, redirecionamento e pequeno retry."""
+ODD_RE = re.compile(r"\b\d\.\d{2}\b")
+
+# ---------- CACHE GLOBAL (15s) ----------
+# Tudo que consulta fonte externa fica em cache por 15s e é COMPARTILHADO entre usuários
+@st.cache_data(ttl=15)  # <-- cache global de 15 segundos
+def read_sheet(csv_url: str) -> pd.DataFrame:
+    """Lê a planilha (CSV publicado). Inclui backoff para evitar 429."""
+    if not csv_url:
+        return pd.DataFrame(columns=["mercado","betano","bet365","kto","atualizado_em"])
+
+    # Exponential backoff para 429/erros transitórios
+    delay = 0.5
+    for attempt in range(5):
+        try:
+            df = pd.read_csv(csv_url)
+            # normaliza colunas esperadas
+            for c in ["mercado","betano","bet365","kto","atualizado_em"]:
+                if c not in df.columns:
+                    df[c] = ""
+            return df[["mercado","betano","bet365","kto","atualizado_em"]]
+        except Exception as e:
+            if attempt == 4:
+                raise
+            time.sleep(delay)
+            delay *= 2  # backoff
+
+@st.cache_data(ttl=15)  # <-- cache global da raspagem KTO
+def fetch_kto_html(url: str) -> str:
+    if not url:
+        return ""
     with requests.Session() as s:
         s.headers.update(HEADERS)
-
-        # 1) visita a home p/ ganhar cookies de sessão (ajuda em sites com WAF)
-        try:
-            base = "https://www.betano.bet.br" if "betano" in url else (
-                   "https://kto.bet.br" if "kto.bet.br" in url else None)
-            if base:
-                s.get(base, timeout=15, allow_redirects=True)
-        except Exception:
-            pass
-
-        # 2) tenta a URL alvo (2 tentativas)
-        last_exc = None
-        for _ in range(2):
-            try:
-                r = s.get(url, timeout=25, allow_redirects=True)
-                # alguns WAFs devolvem 403/429 temporário
-                if r.status_code == 200 and r.text:
-                    return r.text
-                time.sleep(1.2)
-            except Exception as e:
-                last_exc = e
-                time.sleep(1.2)
-        if last_exc:
-            raise last_exc
-        raise RuntimeError(f"Falha ao carregar {url}")
-
-def is_corners_label(txt: str) -> bool:
-    """Detecta textos de mercado de escanteios."""
-    t = txt.lower()
-    return any(k in t for k in [
-        "escanteio", "escanteios", "corners", "corner",
-        "total de escanteios", "total corners"
-    ])
-
-ODD_RE = re.compile(r"\b(?:1|2|3)\.\d{2}\b")  # ex: 1.85, 2.10, 3.05
+        r = s.get(url, timeout=20)
+        # falhas transitórias → pequena espera e reler via cache na próxima chamada
+        r.raise_for_status()
+        return r.text
 
 def normalize_market(raw: str) -> str:
-    """Normaliza rótulos tipo 'Mais de 10.5 escanteios'/'Over 10.5 corners'."""
-    t = " ".join(raw.split())
-    t_low = t.lower()
-    # capturar 8.5/9.5/10.5 etc
-    m = re.search(r"(\d+(?:[.,]\d)?)", t_low)
+    t = " ".join(str(raw).split())
+    low = t.lower()
+    m = re.search(r"(\d+(?:[.,]\d)?)", low)
     num = m.group(1).replace(",", ".") if m else ""
-    if "menos" in t_low or "under" in t_low:
-        base = f"Menos de {num} escanteios" if num else "Menos (escanteios)"
-    elif "mais" in t_low or "over" in t_low:
-        base = f"Mais de {num} escanteios" if num else "Mais (escanteios)"
-    elif "handicap" in t_low:
-        base = f"Handicap escanteios {num}" if num else "Handicap escanteios"
-    else:
-        base = t  # deixa como veio
-    return base
+    if "menos" in low or "under" in low:
+        return f"Menos de {num} escanteios" if num else "Menos (escanteios)"
+    if "mais" in low or "over" in low:
+        return f"Mais de {num} escanteios" if num else "Mais (escanteios)"
+    return t
 
-# ---------- BETANO ----------
-
-def scrape_betano(url: str):
-    """
-    Betano costuma embutir blocos <script> com JSON de mercados OU HTML com as linhas.
-    Estratégia:
-      1) procurar JSON com 'markets'/'selections'
-      2) se não achar, varrer o HTML procurando blocos onde o título menciona escanteios
-         e extrair odds (1.80, 1.95 etc).
-    Retorna: dict { mercado_normalizado: odd }
-    """
+def scrape_kto(url: str) -> dict:
     data = {}
-    html = get_html(url)
-    soup = BeautifulSoup(html, "lxml")
-
-    # 1) tentar achar JSON em scripts
-    scripts = soup.find_all("script")
-    for sc in scripts:
-        txt = sc.string or sc.text or ""
-        if not txt or ("market" not in txt and "markets" not in txt):
-            continue
-        # extrair trechos JSON grosseiramente
-        for match in re.finditer(r"\{.*\}", txt, re.DOTALL):
-            chunk = match.group(0)
-            if "escante" in chunk.lower() or "corner" in chunk.lower():
-                try:
-                    obj = json.loads(chunk)
-                except Exception:
-                    continue
-                # caminhos comuns (variável entre deploys)
-                candidates = []
-                if isinstance(obj, dict):
-                    if "markets" in obj: candidates = obj["markets"]
-                    elif "data" in obj and isinstance(obj["data"], dict) and "markets" in obj["data"]:
-                        candidates = obj["data"]["markets"]
-                for mk in candidates or []:
-                    name = mk.get("name") or mk.get("marketName") or ""
-                    if name and is_corners_label(name):
-                        for sel in mk.get("selections", []) or mk.get("outcomes", []) or []:
-                            label = sel.get("name") or sel.get("selectionName") or ""
-                            price = sel.get("price") or sel.get("odd") or sel.get("odds")
-                            if label and price:
-                                market = normalize_market(f"{label} {name}")
-                                try:
-                                    data[market] = float(str(price).replace(",", "."))
-                                except Exception:
-                                    pass
-    # 2) fallback: varrer HTML
-    if not data:
-        # procurar cards/blocos com títulos contendo escanteios
-        for blk in soup.find_all(True, string=is_corners_label):
-            # subir ao container
-            cont = blk.parent
-            for _ in range(3):
-                if cont and cont.find_all(text=ODD_RE):
-                    break
-                cont = cont.parent
-            if not cont:
-                continue
-            # odds no container
-            odds_texts = [m.group(0) for m in ODD_RE.finditer(cont.get_text(" "))]
-            # rótulos
-            labels = [t for t in re.split(r"[\n\r]+", cont.get_text("\n")) if t.strip()]
-            # tentar combinar
-            for lab in labels:
-                if any(x in lab.lower() for x in ["mais", "menos", "over", "under"]):
-                    m = ODD_RE.search(lab)
-                    odd_here = m.group(0) if m else (odds_texts.pop(0) if odds_texts else None)
-                    if odd_here:
-                        data[normalize_market(lab)] = float(odd_here)
+    if not url:
+        return data
+    try:
+        html = fetch_kto_html(url)  # usa a função cacheada
+        if not html:
+            return data
+        soup = BeautifulSoup(html, "lxml")
+        # procurar blocos com "escanteios"/"corners"
+        def has_corners(s):
+            return s and any(k in s.lower() for k in ["escanteio", "escanteios", "corner", "corners"])
+        for node in soup.find_all(True, string=has_corners):
+            cont = node.parent
+            text = cont.get_text("\n", strip=True)
+            for ln in [ln for ln in text.splitlines() if ln]:
+                if any(k in ln.lower() for k in ["mais", "menos", "over", "under"]):
+                    m = ODD_RE.search(ln)
+                    if m:
+                        data[normalize_market(ln)] = float(m.group(0))
+    except Exception:
+        pass
     return data
-
-# ---------- KTO ----------
-
-def scrape_kto(url: str):
-    """
-    KTO normalmente traz HTML com os mercados na página do evento.
-    Estratégia similar ao fallback da Betano.
-    """
-    data = {}
-    html = get_html(url)
-    soup = BeautifulSoup(html, "lxml")
-
-    # procurar blocos que mencionam escanteios
-    for title_node in soup.find_all(True, string=is_corners_label):
-        cont = title_node.parent
-        for _ in range(3):
-            if cont and cont.get_text():
-                break
-            cont = cont.parent
-        if not cont:
-            continue
-
-        text = cont.get_text("\n")
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        # buscar linhas com "mais/menos/over/under" e um número com .5
-        for ln in lines:
-            if any(k in ln.lower() for k in ["mais", "menos", "over", "under"]):
-                odd = None
-                m = ODD_RE.search(ln)
-                if m:
-                    odd = m.group(0)
-                # se a odd não estiver na mesma linha, procurar na sequência
-                if odd is None:
-                    # vasculhar vizinhança de odds
-                    odds_around = ODD_RE.findall(text)
-                    if odds_around:
-                        odd = odds_around.pop(0)
-                if odd:
-                    data[normalize_market(ln)] = float(odd)
-    return data
-
-# ---------- Comparação & UI ----------
-
-def compare_corners(betano_url, bet365_url, kto_url):
-    """Retorna estrutura para exibir na tabela."""
-    # raspa betano e kto
-    betano = scrape_betano(betano_url) if betano_url else {}
-    kto = scrape_kto(kto_url) if kto_url else {}
-
-    # bet365 ainda simulado (até fazermos módulo próprio)
-    bet365 = {}
-    if bet365_url:
-        # placeholder
-        bet365 = {}
-
-    # combinar todos os mercados encontrados
-    all_markets = sorted(set(list(betano.keys()) + list(kto.keys()) + list(bet365.keys())))
-
-    rows = []
-    for mk in all_markets:
-        rows.append({
-            "Mercado": mk,
-            "Betano": betano.get(mk, "—"),
-            "Bet365": bet365.get(mk, "—"),
-            "KTO":    kto.get(mk, "—"),
-        })
-    return rows
 
 # ---------- UI ----------
-
 c1, c2, c3 = st.columns(3)
-with c1: link_betano = st.text_input("Link Betano", placeholder="https://br.betano.com/...")
-with c2: link_bet365 = st.text_input("Link Bet365", placeholder="https://www.bet365.com/...")
-with c3: link_kto    = st.text_input("Link KTO",    placeholder="https://kto.com/...")
+with c1: link_betano = st.text_input("Link Betano (referência)", placeholder="https://www.betano.bet.br/...")
+with c2: link_bet365 = st.text_input("Link Bet365 (referência)", placeholder="https://www.bet365.com/...")
+with c3: link_kto    = st.text_input("Link KTO (raspagem leve)", placeholder="https://kto.bet.br/...")
 
 if st.button("🔄 Atualizar Odds"):
-    try:
-        rows = compare_corners(link_betano.strip(), link_bet365.strip(), link_kto.strip())
-        if not rows:
-            st.warning("Não encontrei mercados de escanteios. Verifique se os links são de uma PÁGINA DE JOGO.")
-        else:
-            st.success("Odds atualizadas!")
-            # montar tabela
-            st.dataframe(rows, use_container_width=True)
-            st.caption("Dica: onde aparecer '—' significa que a casa não oferece aquele mercado.")
-    except Exception as e:
-        st.error(f"Erro ao buscar: {e}")
-        st.caption("Sites podem bloquear scraping, mudar HTML ou exigir login. Tente novamente mais tarde.")
+    # 1) Lê planilha (preenchida fora do Cloud). Aqui ficam Betano/Bet365.
+    sheet = read_sheet(SHEET_CSV_URL)
+
+    # 2) Raspagem leve da KTO (direto do link, cacheada por 15s)
+    kto_map = scrape_kto(link_kto.strip())
+
+    # 3) Junta tudo por mercado
+    rows = {}
+    for _, r in sheet.iterrows():
+        mk = normalize_market(r["mercado"])
+        rows.setdefault(mk, {"Mercado": mk, "Betano": "—", "Bet365": "—", "KTO": "—"})
+        if str(r["betano"]).strip(): rows[mk]["Betano"] = r["betano"]
+        if str(r["bet365"]).strip(): rows[mk]["Bet365"] = r["bet365"]
+        if str(r["kto"]).strip():    rows[mk]["KTO"]    = r["kto"]
+    for mk, odd in kto_map.items():
+        rows.setdefault(mk, {"Mercado": mk, "Betano": "—", "Bet365": "—", "KTO": "—"})
+        rows[mk]["KTO"] = odd
+
+    if not rows:
+        st.warning("Sem dados. Publique sua planilha (Arquivo → Publicar na Web → CSV) ou informe um link válido da KTO.")
+    else:
+        st.success("Odds atualizadas! (cache global por 15s)")
+        st.dataframe(list(rows.values()), use_container_width=True)
+        st.caption("Onde aparecer “—” significa que a casa não oferece aquele mercado ou não foi encontrado.")
