@@ -3,8 +3,7 @@ import pandas as pd
 import streamlit as st
 
 # Puxa a URL do Secrets
-CSV_URL = os.environ.get("SHEET_CSV_URL")
-
+URL_CSV = os.environ.get("SHEET_CSV_URL")
 @st.cache_data(ttl=15)  # cache de 15s para não sobrecarregar
 def read_sheet(url):
     return pd.read_csv(url)
