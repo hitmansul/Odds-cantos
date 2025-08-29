@@ -1,5 +1,5 @@
-streamlit
-requests
-beautifulsoup4
+fastapi
+uvicorn[standard]
+playwright
+bs4
 lxml
-pandas
