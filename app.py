@@ -21,7 +21,7 @@ HEADERS = {
     "Referer": "https://google.com",
     "Connection": "keep-alive",
 }
-ODD_RE = re.compile(r"\b\d\.\d{2}\b")  # 1.85, 2.10 etc.
+ODD_RE = re.compile(r"\b\d\.\d{2}\b")
 
 def is_corners_label(txt: str) -> bool:
     if not txt: return False
@@ -42,7 +42,6 @@ def normalize_market(raw: str) -> str:
     return t
 
 def get_html(url: str) -> str:
-    """Sessão com headers, visita home p/ cookies, 2 tentativas."""
     host = urlparse(url).netloc.lower()
     home = None
     if "betano" in host:
@@ -72,13 +71,11 @@ def get_html(url: str) -> str:
 
 # ---------- Betano ----------
 def scrape_betano(url: str) -> dict:
-    """Tenta JSON embutido; se não, varre HTML por blocos de escanteios."""
     data = {}
     if not url: return data
     html = get_html(url)
     soup = BeautifulSoup(html, "lxml")
 
-    # 1) procurar JSON em <script>
     for sc in soup.find_all("script"):
         txt = (sc.string or sc.text or "")
         if not txt or ("market" not in txt and "markets" not in txt):
@@ -107,15 +104,12 @@ def scrape_betano(url: str) -> dict:
                                     data[market] = float(str(price).replace(",", "."))
                                 except Exception:
                                     pass
-    # 2) fallback: varrer HTML
     if not data:
         node = soup.find(string=is_corners_label)
         if node:
             cont = node.parent
-            # subir até container com odds
             for _ in range(3):
-                if cont and cont.get_text():
-                    break
+                if cont and cont.get_text(): break
                 cont = cont.parent
             if cont:
                 text = cont.get_text("\n", strip=True)
@@ -151,9 +145,7 @@ def scrape_kto(url: str) -> dict:
 
 # ---------- Bet365 (placeholder) ----------
 def scrape_bet365(_url: str) -> dict:
-    # Bet365 carrega via JS e WebSocket; normalmente exige Selenium/Playwright.
-    # Aqui retornamos vazio para não travar o app.
-    return {}
+    return {}  # vazio por enquanto
 
 # ---------- UI ----------
 c1, c2, c3 = st.columns(3)
@@ -185,15 +177,5 @@ if st.button("🔄 Atualizar Odds"):
             st.caption("“—” indica que a casa não oferece aquele mercado.")
     except requests.HTTPError as e:
         st.error(f"Falha HTTP ao carregar página: {e}")
-        st.caption("Muitos sites bloqueiam IP de servidor (403) ou exigem JS/logado. Teste localmente (PC/Android via Termux) se necessário.")
     except Exception as e:
         st.error(f"Erro ao buscar: {e}")
-        st.caption("Se persistir, é provável bloqueio do site. Ver ‘Referências’ no rodapé do app.")
-
-with st.expander("Referências técnicas (oficiais)"):
-    st.markdown(
-        "- **Requests (HTTP)**: https://requests.readthedocs.io/\n"
-        "- **BeautifulSoup/bs4**: https://www.crummy.com/software/BeautifulSoup/bs4/doc/\n"
-        "- **Streamlit (deploy/cache)**: https://docs.streamlit.io/\n"
-        "- **HTTP 403 (Forbidden)** – MDN: https://developer.mozilla.org/pt-BR/docs/Web/HTTP/Status/403"
-    )
